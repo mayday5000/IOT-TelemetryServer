@@ -5,7 +5,7 @@
 //
 // How it works:
 // - Main thread is the reactor: sleeps in epoll_wait (no timeout), accepts, reads, and splits each
-//   connection's byte stream into '\n'-terminated lines (one packet per line, max 128 bytes).
+//   connection's byte stream into '\n'-terminated lines (one packet per line, max 128 bytes of content; CRLF accepted).
 // - Worker threads block on a condition variable, validate "temperature,humidity" lines, and
 //   drain the queue on shutdown.
 // - SIGINT/SIGTERM set an atomic flag and write to an eventfd that wakes the reactor instantly.
@@ -31,6 +31,8 @@
 #include <charconv>
 #include <format>
 
+#include "line_framer.hpp"
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
@@ -39,7 +41,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-constexpr size_t MAX_PACKET_SIZE = 128;  // Max line length in bytes, excluding '\n'
 constexpr size_t READ_CHUNK_SIZE = 4096;
 constexpr size_t MAX_EVENTS      = 64;
 constexpr size_t MAX_QUEUE_SIZE  = 10000;
@@ -236,8 +237,8 @@ int main() {
     std::cout << "[REACTOR] Listening on port " << SERVER_PORT << " (Ctrl-C to stop)\n";
     std::vector<epoll_event> events(MAX_EVENTS);
 
-    // Per-connection buffer holding the bytes of a line whose '\n' has not arrived yet
-    std::unordered_map<int, std::string> partial_lines;
+    // Per-connection framer holding the bytes of a line whose '\n' has not arrived yet
+    std::unordered_map<int, LineFramer> framers;
 
     auto push_line = [&pipeline](int fd, std::string_view line) {
         auto packet = std::make_unique<TelemetryPacket>();
@@ -301,26 +302,16 @@ int main() {
                 // Read first: a client that sends data and then closes delivers EPOLLIN together with
                 // EPOLLRDHUP/EPOLLHUP, and that final data must be drained before the socket is closed.
                 bool connection_closed = (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
-                bool line_too_long = false;
-                std::string& pending = partial_lines[current_fd];
+                LineFramer& framer = framers[current_fd];
                 char chunk[READ_CHUNK_SIZE];
 
-                while (!line_too_long) {
+                while (!framer.oversize()) {
                     ssize_t bytes_read = read(current_fd, chunk, sizeof(chunk));
                     if (bytes_read > 0) {
-                        // Split the stream on '\n': one packet per complete line
+                        // Split the stream on '\n': one packet per complete line (CRLF accepted)
                         std::string_view data(chunk, static_cast<size_t>(bytes_read));
-                        size_t newline;
-                        while ((newline = data.find('\n')) != std::string_view::npos) {
-                            if (pending.size() + newline > MAX_PACKET_SIZE) { line_too_long = true; break; }
-                            pending.append(data.substr(0, newline));
-                            if (!pending.empty() && pending.back() == '\r') pending.pop_back(); // Accept CRLF
-                            if (!pending.empty()) push_line(current_fd, pending);              // Skip blank lines
-                            pending.clear();
-                            data.remove_prefix(newline + 1);
-                        }
-                        if (!line_too_long && pending.size() + data.size() > MAX_PACKET_SIZE) line_too_long = true;
-                        if (!line_too_long) pending.append(data);
+                        auto st = framer.feed(data, [&](std::string_view line) { push_line(current_fd, line); });
+                        if (st == LineFramer::Status::Oversize) break;
                     } else if (bytes_read == 0) {
                         connection_closed = true;
                         break;
@@ -332,24 +323,23 @@ int main() {
                     }
                 }
 
-                if (line_too_long) {
+                if (framer.oversize()) {
                     // Policy: a line longer than MAX_PACKET_SIZE means a broken or hostile sender;
                     // the stream cannot be trusted to resynchronise, so the client is disconnected.
                     g_oversize_disconnects.fetch_add(1, std::memory_order_relaxed);
                     std::cerr << "[REACTOR] Line longer than " << MAX_PACKET_SIZE
                               << " bytes from fd=" << current_fd << "; disconnecting.\n";
-                    pending.clear();
                     connection_closed = true;
                 }
 
                 if (connection_closed) {
-                    if (!pending.empty()) {
+                    if (!framer.pending().empty()) {
                         // A final line without '\n' may be truncated, so it is not processed
                         g_unterminated_discarded.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "[REACTOR] Discarded " << pending.size()
+                        std::cerr << "[REACTOR] Discarded " << framer.pending().size()
                                   << "-byte unterminated line from fd=" << current_fd << "\n";
                     }
-                    partial_lines.erase(current_fd);
+                    framers.erase(current_fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
                     close(current_fd);
                     std::cout << "[REACTOR] Client disconnected fd=" << current_fd << "\n";

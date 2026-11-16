@@ -90,7 +90,7 @@ The reactor never blocks on application work; parsing and logging of readings ha
 ### 3. Line Framing Contract
 
 - One reading per line: `temperature,humidity\n`, e.g. `23.38,48\n`. Temperature is a decimal number in -40..125 °C, humidity an integer in 0..100 %. Anything else is counted and logged as invalid by the workers.
-- Maximum line length is 128 bytes (MAX_PACKET_SIZE, excluding `\n`). A longer line disconnects the client, because the stream can no longer be trusted to resynchronise.
+- Maximum line length is 128 bytes of content (MAX_PACKET_SIZE), excluding `\n` and a trailing `\r` of a CRLF terminator. A 128-byte line ending in `\r\n` is accepted; a longer line disconnects the client, because the stream can no longer be trusted to resynchronise.
 - A final line without `\n` when the connection closes may be truncated, so it is discarded and logged.
 - At shutdown the server prints `valid`, `invalid`, `oversize_disconnects` and `unterminated_discarded` counts.
 
@@ -118,12 +118,13 @@ CLIENT (single thread):
 ## Project Structure
 
 ```
-├── README.md     # Project documentation
-├── LICENSE       # MIT License
-├── deploy.sh     # Idempotent Linux dependency & build script
-├── server.cpp    # Epoll reactor, line framing, bounded pipeline, and jthread worker pool
-├── client.cpp    # Simulated sensor telemetry publisher
-└── tests.cpp     # Standalone sanity checks (stop flag, thread teardown, sample string)
+├── README.md        # Project documentation
+├── LICENSE          # MIT License
+├── deploy.sh        # Idempotent Linux dependency & build script
+├── line_framer.hpp  # Newline/CRLF line framer (shared by server.cpp and tests)
+├── server.cpp       # Epoll reactor, line framing, bounded pipeline, and jthread worker pool
+├── client.cpp       # Simulated sensor telemetry publisher
+└── tests.cpp        # Line-framer unit tests and basic sanity checks
 ```
 
 ## Quick Start
@@ -260,7 +261,7 @@ The client uses the same eventfd doorbell: its poll() wakes immediately on Ctrl-
 
 ### Unit Testing (tests.cpp)
 
-tests.cpp is a standalone program with four quick sanity checks: the atomic stop flag starts true and can be cleared, a polling thread exits when the flag is cleared, and a sample comma-separated string ends with a newline. It does not include server.cpp or client.cpp, so it does not exercise the reactor, line framing, validation or shutdown path; those are verified by running the server and client together.
+tests.cpp links against line_framer.hpp (the same framer the reactor uses) and checks that a 128-byte LF line is accepted, a 128-byte CRLF line is accepted, a 129-byte line is rejected, a CRLF terminator split across two reads (`\r` then `\n`) is accepted at 128 bytes, and blank lines are skipped. It also keeps a few sanity checks: the atomic stop flag starts true and can be cleared, a polling thread exits when the flag is cleared, and a sample `temperature,humidity` line has the expected format. It does not include server.cpp or client.cpp, so it does not exercise the epoll reactor, worker validation or shutdown path; those are verified by running the server and client together.
 
 ### Troubleshooting
 
