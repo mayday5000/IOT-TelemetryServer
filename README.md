@@ -1,5 +1,7 @@
 # IoT Telemetry Server
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A high-performance, low-CPU telemetry ingestion server and client written in modern C++23 for edge IoT deployments.
 
 Built on the classic Reactor pattern, a single server thread demultiplexes non-blocking socket I/O using Linux epoll (edge-triggered) and dispatches complete payloads to a static worker thread pool via a bounded, thread-safe queue. Decoupling I/O from processing enables the server to ingest thousands of concurrent sensor streams with near-zero idle CPU usage.
@@ -255,6 +257,6 @@ All diagnostic output appears on standard output and standard error. In producti
 The worker count is computed as twice the hardware concurrency reported by the standard library, with a fallback of four threads when the query returns zero. This sizing provides enough concurrency to absorb short processing bursts while remaining modest for a pure I/O-bound workload.
 
 
-**License**
+## License
 
-This project is licensed under the [<u>MIT License</u>](https://github.com/mayday5000/IOT-TelemetryServer/blob/main/LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
+This project is licensed under the [MIT License](LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
