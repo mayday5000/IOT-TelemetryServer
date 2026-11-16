@@ -208,13 +208,11 @@ int main() {
                         close(client_fd);
                     }
                 }
-            } else if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                close(current_fd);
-                std::cout << "[REACTOR] Closed fd=" << current_fd << "\n";
-            } else if (events[i].events & EPOLLIN) {
+            } else {
+                // Read first: a client that sends data and then closes delivers EPOLLIN together with
+                // EPOLLRDHUP/EPOLLHUP, and that final data must be drained before the socket is closed.
                 auto packet = std::make_unique<TelemetryPacket>();
-                bool connection_closed = false;
+                bool connection_closed = (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
 
                 while (true) {
                     ssize_t bytes_read = read(current_fd, packet->raw_payload, MAX_PACKET_SIZE);
