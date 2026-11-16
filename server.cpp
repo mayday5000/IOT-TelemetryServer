@@ -4,8 +4,10 @@
 // thread-safe queue. Designed for low CPU idle and clean shutdown.
 //
 // How it works:
-// - Main thread is the reactor: sleeps in epoll_wait (no timeout), accepts, reads, enqueues.
-// - Worker threads block on a condition variable, process packets, and drain the queue on shutdown.
+// - Main thread is the reactor: sleeps in epoll_wait (no timeout), accepts, reads, and splits each
+//   connection's byte stream into '\n'-terminated lines (one packet per line, max 128 bytes).
+// - Worker threads block on a condition variable, validate "temperature,humidity" lines, and
+//   drain the queue on shutdown.
 // - SIGINT/SIGTERM set an atomic flag and write to an eventfd that wakes the reactor instantly.
 // - RAII destructors scrub packet memory.
 
@@ -19,10 +21,15 @@
 #include <memory>
 #include <cstring>
 #include <cstdint>
+#include <optional>
 #include <cerrno>
 #include <csignal>
 #include <chrono>
-#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <charconv>
+#include <format>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,7 +39,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-constexpr size_t MAX_PACKET_SIZE = 128;
+constexpr size_t MAX_PACKET_SIZE = 128;  // Max line length in bytes, excluding '\n'
+constexpr size_t READ_CHUNK_SIZE = 4096;
 constexpr size_t MAX_EVENTS      = 64;
 constexpr size_t MAX_QUEUE_SIZE  = 10000;
 constexpr int    SERVER_PORT     = 8883;
@@ -100,6 +108,31 @@ bool make_socket_non_blocking(int fd) {
 }
 
 std::atomic<bool> g_running{true};
+
+// Line statistics, reported at shutdown
+std::atomic<uint64_t> g_valid_lines{0}, g_invalid_lines{0}, g_oversize_disconnects{0}, g_unterminated_discarded{0};
+
+struct Reading {
+    float temperature_c;
+    int   humidity_pct;
+};
+
+// Parses "temperature,humidity" (e.g. "24.51,55"). Rejects extra characters and out-of-range values.
+std::optional<Reading> parse_reading(std::string_view line) {
+    auto comma = line.find(',');
+    if (comma == std::string_view::npos) return std::nullopt;
+    Reading r{};
+    const char* t_begin = line.data();
+    const char* t_end   = line.data() + comma;
+    const char* h_begin = t_end + 1;
+    const char* h_end   = line.data() + line.size();
+    auto [tp, tec] = std::from_chars(t_begin, t_end, r.temperature_c);
+    auto [hp, hec] = std::from_chars(h_begin, h_end, r.humidity_pct);
+    if (tec != std::errc{} || tp != t_end || hec != std::errc{} || hp != h_end) return std::nullopt;
+    if (r.temperature_c < -40.0f || r.temperature_c > 125.0f) return std::nullopt; // Typical sensor range
+    if (r.humidity_pct < 0 || r.humidity_pct > 100) return std::nullopt;
+    return r;
+}
 
 // Shutdown "doorbell": eventfd watched by epoll so the reactor can sleep with no timeout
 int g_wake_fd = -1;
@@ -186,15 +219,36 @@ int main() {
         workers.emplace_back([pipeline]() {
             // Keep consuming until shutdown is requested and the queue is fully drained
             while (auto packet = pipeline->pop()) {
-                std::span<const uint8_t> view(packet->raw_payload, packet->payload_len);
-                std::cout << "[WORKER] Processed fd=" << packet->device_id
-                          << " len=" << view.size() << "\n";
+                std::string_view line(reinterpret_cast<const char*>(packet->raw_payload), packet->payload_len);
+                if (auto reading = parse_reading(line)) {
+                    g_valid_lines.fetch_add(1, std::memory_order_relaxed);
+                    std::cout << std::format("[WORKER] fd={} temperature={:.2f} C humidity={} %\n",
+                                             packet->device_id, reading->temperature_c, reading->humidity_pct);
+                } else {
+                    g_invalid_lines.fetch_add(1, std::memory_order_relaxed);
+                    std::cout << std::format("[WORKER] Invalid reading from fd={} (len={}) dropped\n",
+                                             packet->device_id, packet->payload_len);
+                }
             }
         });
     }
 
     std::cout << "[REACTOR] Listening on port " << SERVER_PORT << " (Ctrl-C to stop)\n";
     std::vector<epoll_event> events(MAX_EVENTS);
+
+    // Per-connection buffer holding the bytes of a line whose '\n' has not arrived yet
+    std::unordered_map<int, std::string> partial_lines;
+
+    auto push_line = [&pipeline](int fd, std::string_view line) {
+        auto packet = std::make_unique<TelemetryPacket>();
+        std::memcpy(packet->raw_payload, line.data(), line.size()); // line.size() <= MAX_PACKET_SIZE
+        packet->payload_len = line.size();
+        packet->device_id = fd;
+        packet->timestamp_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        pipeline->push(std::move(packet));
+    };
 
     while (g_running.load(std::memory_order_relaxed)) {
         int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1); // Sleep until I/O or shutdown
@@ -246,19 +300,27 @@ int main() {
             } else {
                 // Read first: a client that sends data and then closes delivers EPOLLIN together with
                 // EPOLLRDHUP/EPOLLHUP, and that final data must be drained before the socket is closed.
-                auto packet = std::make_unique<TelemetryPacket>();
                 bool connection_closed = (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
+                bool line_too_long = false;
+                std::string& pending = partial_lines[current_fd];
+                char chunk[READ_CHUNK_SIZE];
 
-                while (true) {
-                    ssize_t bytes_read = read(current_fd, packet->raw_payload, MAX_PACKET_SIZE);
+                while (!line_too_long) {
+                    ssize_t bytes_read = read(current_fd, chunk, sizeof(chunk));
                     if (bytes_read > 0) {
-                        packet->payload_len = static_cast<size_t>(bytes_read);
-                        packet->timestamp_ns = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count());
-                        packet->device_id = current_fd;
-                        pipeline->push(std::move(packet));
-                        packet = std::make_unique<TelemetryPacket>();
+                        // Split the stream on '\n': one packet per complete line
+                        std::string_view data(chunk, static_cast<size_t>(bytes_read));
+                        size_t newline;
+                        while ((newline = data.find('\n')) != std::string_view::npos) {
+                            if (pending.size() + newline > MAX_PACKET_SIZE) { line_too_long = true; break; }
+                            pending.append(data.substr(0, newline));
+                            if (!pending.empty() && pending.back() == '\r') pending.pop_back(); // Accept CRLF
+                            if (!pending.empty()) push_line(current_fd, pending);              // Skip blank lines
+                            pending.clear();
+                            data.remove_prefix(newline + 1);
+                        }
+                        if (!line_too_long && pending.size() + data.size() > MAX_PACKET_SIZE) line_too_long = true;
+                        if (!line_too_long) pending.append(data);
                     } else if (bytes_read == 0) {
                         connection_closed = true;
                         break;
@@ -270,7 +332,24 @@ int main() {
                     }
                 }
 
+                if (line_too_long) {
+                    // Policy: a line longer than MAX_PACKET_SIZE means a broken or hostile sender;
+                    // the stream cannot be trusted to resynchronise, so the client is disconnected.
+                    g_oversize_disconnects.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "[REACTOR] Line longer than " << MAX_PACKET_SIZE
+                              << " bytes from fd=" << current_fd << "; disconnecting.\n";
+                    pending.clear();
+                    connection_closed = true;
+                }
+
                 if (connection_closed) {
+                    if (!pending.empty()) {
+                        // A final line without '\n' may be truncated, so it is not processed
+                        g_unterminated_discarded.fetch_add(1, std::memory_order_relaxed);
+                        std::cerr << "[REACTOR] Discarded " << pending.size()
+                                  << "-byte unterminated line from fd=" << current_fd << "\n";
+                    }
+                    partial_lines.erase(current_fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
                     close(current_fd);
                     std::cout << "[REACTOR] Client disconnected fd=" << current_fd << "\n";
@@ -288,6 +367,9 @@ int main() {
     close(server_fd);
     close(epoll_fd);
     close(g_wake_fd);
+    std::cout << "[SYSTEM] Lines: valid=" << g_valid_lines << " invalid=" << g_invalid_lines
+              << " oversize_disconnects=" << g_oversize_disconnects
+              << " unterminated_discarded=" << g_unterminated_discarded << "\n";
     std::cout << "[SYSTEM] Shutdown complete.\n";
     return 0;
 }
