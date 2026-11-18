@@ -24,7 +24,7 @@ public:
     // The buffer stays bounded: at most MAX_PACKET_SIZE + 1 bytes, and the extra
     // byte is allowed only when it is a trailing '\r' waiting for a '\n'.
     template <typename F>
-    Status feed(std::string_view data, F&& on_line) {
+    [[nodiscard]] Status feed(std::string_view data, F&& on_line) {
         if (oversize_) return Status::Oversize;
 
         while (true) {
@@ -64,12 +64,12 @@ public:
         return Status::Ok;
     }
 
-    Status feed(std::string_view data, std::vector<std::string>& lines) {
+    [[nodiscard]] Status feed(std::string_view data, std::vector<std::string>& lines) {
         return feed(data, [&](std::string_view line) { lines.emplace_back(line); });
     }
 
-    const std::string& pending() const { return pending_; }
-    bool oversize() const { return oversize_; }
+    [[nodiscard]] const std::string& pending() const { return pending_; }
+    [[nodiscard]] bool oversize() const { return oversize_; }
 
 private:
     std::string pending_;
