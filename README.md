@@ -8,7 +8,7 @@ Built on the classic Reactor pattern, a single server thread demultiplexes non-b
 
 **How it stays low-power:** nothing in the system busy-waits or polls on a timer. The server's reactor sleeps inside the kernel in `epoll_wait` with no timeout and is woken only when a socket is ready or when the shutdown `eventfd` is signaled, so an idle server adds zero periodic wake-ups. Idle worker threads block on a condition variable instead of polling the queue. The worker pool is created once at startup (no thread churn), packets are small fixed-size buffers, and the queue is capped, so memory stays bounded. The client sleeps in a single `poll()` call between readings (one wake-up per reading) and sends compact lines of about 9 bytes.
 
-The companion client connects over TCP and emits simulated sensor readings in a lightweight line format (`temperature,humidity\n`, for example `23.38,48`). Both processes support deterministic, graceful shutdown on SIGINT and SIGTERM, woken instantly through an `eventfd` instead of a polling timeout.
+The companion client connects over TCP and emits simulated sensor readings in a lightweight line format (`temperature,humidity\n`, for example `23.38,48`). If the server is down or the connection drops, it prints a clear reason and reconnects by itself with exponential backoff, sending nothing until it is connected again. Both processes support deterministic, graceful shutdown on SIGINT and SIGTERM, woken instantly through an `eventfd` instead of a polling timeout.
 
 ## Key Features
 
@@ -23,8 +23,13 @@ The companion client connects over TCP and emits simulated sensor readings in a 
 - Non-Blocking Accept & Read Loops: Exhaustive EAGAIN drain loops; `accept4()` also handles EINTR/ECONNABORTED and descriptor exhaustion (EMFILE/ENFILE) with a spare descriptor, so the edge-triggered listener never stalls.
 - Static Worker Thread Pool: Sized to 2 × std::thread::hardware_concurrency() (4 if the core count is unknown).
 - Bounded Queue (Drop-Oldest): Capped at 10,000 packets; when full, the oldest packet is dropped so memory cannot grow without limit and the reactor never stalls.
-- RAII Memory Scrubbing: The TelemetryPacket destructor zeroes the payload buffer with std::memset whenever a packet is destroyed (processed, dropped on overflow, or unwound by an exception).
-- Reset-Safe Client Writes: The client sends with `send(..., MSG_NOSIGNAL)`, ignores SIGPIPE, and handles partial sends; a server that resets or closes the connection ends the client cleanly instead of killing it.
+- RAII Descriptors: Every socket, epoll instance and eventfd is owned by a move-only `UniqueFd`, so early error returns cannot leak descriptors and connected clients are closed at shutdown.
+- Explicit Error Values: Setup and connect helpers return `[[nodiscard]] std::expected<UniqueFd, SysError>` (failed step + errno, no heap), and every `socket`/`setsockopt`/`bind`/`listen`/`epoll_ctl`/`inet_pton` result is checked.
+- Reasoned Rejects: `parse_reading` returns `std::expected<Reading, ParseError>`, and workers log why a line was rejected (missing separator, not a number, out of range, ...).
+- No Wasted Allocations: The reactor reads into one reusable stack buffer and allocates a packet only for a complete line.
+- RAII Memory Scrubbing: The TelemetryPacket destructor zeroes the payload buffer with `explicit_bzero` (which, unlike `memset`, cannot be optimised away) whenever a packet is destroyed (processed, dropped on overflow, or unwound by an exception).
+- Auto-Reconnecting Client: On connect failure or a dropped connection (EOF, EPIPE, ECONNRESET, hang-up) the client prints the reason and retries after 1 s, 2 s, 4 s ... up to 30 s, resetting to 1 s after a successful connect. The backoff wait sleeps in `poll()` on the shutdown eventfd: no wake-ups while waiting, and Ctrl-C exits at once.
+- Reset-Safe Client Writes: The client sends with `send(..., MSG_NOSIGNAL)`, ignores SIGPIPE, and handles partial sends; a server that resets or closes the connection triggers a reconnect instead of killing the client.
 - Graceful Shutdown: SIGINT/SIGTERM set an atomic stop flag and ring the shutdown `eventfd`, waking the reactor instantly from whichever thread received the signal; workers then finish every line already queued before they are joined.
 
 ## System Architecture
@@ -106,13 +111,18 @@ Reactor Thread                  Worker Threads
      │                               │  loop
 
 CLIENT (single thread):
-  connect (non-blocking, interruptible)
+  parse IP and interval              ── bad value: print error, exit 2
   loop:
-    send_all("23.38,48\n")              ── partial sends handled, MSG_NOSIGNAL
-    poll(eventfd, socket, interval)     ── one wake-up per reading
-      ├─ timeout        → next reading
-      ├─ eventfd        → Ctrl-C: stop
-      └─ socket EOF/err → server gone: stop
+    connect_to (non-blocking, 5 s timeout, interruptible)
+      └─ failed → print reason, poll(eventfd, backoff) → retry
+    backoff.reset()
+    loop:
+      send_all("23.38,48\n")            ── std::span, partial sends handled, MSG_NOSIGNAL
+      poll(eventfd, socket, interval)   ── one wake-up per reading
+        ├─ timeout        → next reading
+        ├─ eventfd        → Ctrl-C: stop
+        └─ socket EOF/err → print reason, close, poll(eventfd, backoff) → reconnect
+  backoff: 1 s, 2 s, 4 s, 8 s, 16 s, 30 s, 30 s ...
 ```
 
 ## Project Structure
@@ -121,17 +131,21 @@ CLIENT (single thread):
 ├── README.md        # Project documentation
 ├── LICENSE          # MIT License
 ├── deploy.sh        # Idempotent Linux dependency & build script
-├── line_framer.hpp  # Newline/CRLF line framer (shared by server.cpp and tests)
-├── server.cpp       # Epoll reactor, line framing, bounded pipeline, and jthread worker pool
-├── client.cpp       # Simulated sensor telemetry publisher
-└── tests.cpp        # Line-framer unit tests and basic sanity checks
+├── .gitignore       # Keeps build outputs (server, client, tests) out of git
+├── net_util.hpp     # UniqueFd, SysError, expected-returning socket/epoll/eventfd helpers, send_all, wait_fd, Backoff
+├── line_framer.hpp  # Newline/CRLF line framer
+├── reading.hpp      # parse_reading -> expected<Reading, ParseError>, parse_interval_ms
+├── pipeline.hpp     # TelemetryPacket and the bounded drop-oldest TelemetryPipeline
+├── server.cpp       # Epoll reactor and jthread worker pool
+├── client.cpp       # Simulated sensor telemetry publisher with auto-reconnect
+└── tests.cpp        # Unit tests of the shared headers (the real parser, framer, queue and net helpers)
 ```
 
 ## Quick Start
 
 ### Prerequisites
 
-- Compiler: g++ 13 or newer with C++23 support (`-std=c++23`, `<expected>`, `<format>`, `std::jthread`, floating-point `std::from_chars`); verified with g++ 14.2. Other C++23 toolchains should work but are untested.
+- Compiler: g++ 14 or newer with C++23 support (`-std=c++23`, `<expected>`, `<print>`, `<format>`, `std::jthread`, floating-point `std::from_chars`); verified with g++ 14.2. Other C++23 toolchains should work but are untested.
 - OS: Linux only. Uses epoll (`epoll_create1`, `EPOLLET`, `EPOLLRDHUP`), `accept4` and `eventfd` with `EFD_NONBLOCK | EFD_CLOEXEC`, so kernel 2.6.28 or newer.
 - Libraries: pthread (via `-pthread`); no third-party dependencies.
 
@@ -139,8 +153,8 @@ CLIENT (single thread):
 
 deploy.sh is the single, idempotent entry point on Linux:
 
-1. Inspects the system for g++ and make, installing only what is missing (build-essential on Debian/Ubuntu, gcc-c++ on Fedora/RHEL/yum). It does not check the compiler version, so on distributions whose default g++ is older than 13, install a newer g++ first.
-2. Compiles server, client, and tests with -std=c++23 -O2 -pthread (make is checked for but not used).
+1. Inspects the system for g++ and make, installing only what is missing (build-essential on Debian/Ubuntu, gcc-c++ on Fedora/RHEL/yum). It does not check the compiler version, so on distributions whose default g++ is older than 14, install a newer g++ first.
+2. Compiles server, client, and tests with -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread (make is checked for but not used).
 3. Runs ./tests and stops on failure (set -euo pipefail).
 
 ```bash
@@ -165,19 +179,19 @@ Compile & Run Tests:
 
 ```bash
 # Release build
-g++ -std=c++23 -O2 -Wall -Wextra -DNDEBUG -pthread -o server server.cpp
-g++ -std=c++23 -O2 -Wall -Wextra -DNDEBUG -pthread -o client client.cpp
-g++ -std=c++23 -O2 -Wall -Wextra -pthread -o tests tests.cpp && ./tests
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o server server.cpp
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o client client.cpp
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o tests tests.cpp && ./tests
 
 # Debug build (with Address & Undefined Behavior Sanitizers)
-g++ -std=c++23 -g -O0 -Wall -Wextra -pthread -fsanitize=address,undefined -o server_debug server.cpp
+g++ -std=c++23 -g -O1 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined -o server_debug server.cpp
 ```
 
 ### Running the Server & Client
 
 Usage:
 - `./server` takes no arguments and listens on TCP port 8883 on all IPv4 interfaces (`SERVER_PORT` in server.cpp).
-- `./client [server_ipv4] [interval_ms]` defaults to `127.0.0.1` and `1000`. The interval must be an integer of at least 1; otherwise the client prints its usage and exits with code 2.
+- `./client [server_ipv4] [interval_ms]` defaults to `127.0.0.1` and `1000`. The IP must be an IPv4 dotted quad and the interval an integer of at least 1; otherwise the client prints the reason and its usage and exits with code 2 (retrying cannot fix a configuration error).
 
 Terminal 1 (Start Server):
 
@@ -193,8 +207,9 @@ Terminal 1 (Start Server):
 [WORKER] fd=7 temperature=25.27 C humidity=71 %
 [WORKER] fd=7 temperature=27.85 C humidity=42 %
 [REACTOR] Client disconnected fd=7
+[SYSTEM] Closing 0 client connection(s).
 [SYSTEM] Shutting down. Draining 0 queued packet(s)...
-[SYSTEM] Lines: valid=3 invalid=0 oversize_disconnects=0 unterminated_discarded=0
+[SYSTEM] Lines: valid=3 invalid=0 oversize_disconnects=0 unterminated_discarded=0 dropped_queue_full=0
 [SYSTEM] Shutdown complete.
 ```
 
@@ -213,34 +228,70 @@ Terminal 2 (Start Client):
 [CLIENT] Shutdown complete.
 ```
 
+Client started before the server, then the server stopped mid-stream:
+
+```
+[CLIENT] Connecting to 127.0.0.1:8883...
+[CLIENT] connection refused (is the server running?). Retrying in 1 s.
+[CLIENT] Connecting to 127.0.0.1:8883...
+[CLIENT] connection refused (is the server running?). Retrying in 2 s.
+[CLIENT] Connecting to 127.0.0.1:8883...
+[CLIENT] Connected. Interval=1000 ms. Ctrl-C to stop.
+[CLIENT] Sent: 23.38,48
+[CLIENT] server closed connection. Retrying in 1 s.
+[CLIENT] Connecting to 127.0.0.1:8883...
+[CLIENT] connection refused (is the server running?). Retrying in 2 s.
+^C[CLIENT] Shutdown complete.
+```
+
+Client error messages:
+
+| Message | Meaning | Client action |
+|---------|---------|---------------|
+| `bad IP address (expected IPv4 dotted quad ...)` | `inet_pton` rejected the server IP argument | Exit code 2 |
+| `Invalid interval '...'` | Interval is not an integer >= 1 | Exit code 2 |
+| `connection refused (is the server running?)` | Nothing listens on port 8883 at that IP | Retry with backoff |
+| `connect timeout` | No answer within 5 s (host down, firewall drop) | Retry with backoff |
+| `connect failed: <reason>` | Other connect error, e.g. network unreachable | Retry with backoff |
+| `server closed connection` | Orderly close (EOF / hang-up) | Reconnect with backoff |
+| `server closed connection: <reason>` | Reset or broken pipe (ECONNRESET, EPIPE) | Reconnect with backoff |
+
 The worker count depends on the machine (2 × cores; 16 on an 8-core host). The client simulates readings (temperature 18–32 °C, humidity 30–80 %). The `fd` shown by the server is the connection's socket descriptor; descriptor numbers are reused after a client disconnects.
 
-Press Ctrl-C in either terminal to trigger a graceful shutdown. The client exits with code 0 after Ctrl-C, 1 if it cannot connect or the server closes the connection, and 2 for invalid arguments.
+Press Ctrl-C in either terminal to trigger a graceful shutdown, including while the client is connecting or waiting to reconnect. The client exits with code 0 after Ctrl-C or SIGTERM, 1 if it cannot create its eventfd, and 2 for an invalid IP or interval.
 
-## C++23 Language Dialect & Contracts
+## Modern C++ Features (C++17/20/23)
 
-The codebase is compiled as C++23 and uses standard-library facilities for ownership and thread safety:
+The codebase is compiled as C++23 and uses these modern C++ (C++17/20/23) features, kept deliberately simple:
 
-- std::jthread: Workers join automatically when the std::vector<std::jthread> is cleared or destroyed, so there are no manual join loops.
-- std::unique_ptr<TelemetryPacket>: Each packet has exactly one owner as it moves from the reactor to a worker.
-- std::expected<int, std::string>: The client's try_connect() returns the connected socket or an explanatory error string.
-- std::from_chars: Locale-independent, allocation-free parsing of the interval argument and of each `temperature,humidity` reading.
-- std::format: Fixed-precision formatting of readings and single-call log lines from worker threads.
-- std::atomic: The stop flags and line counters use atomics and are safe to write from a signal handler or several workers.
+- RAII `UniqueFd` (net_util.hpp): a move-only owner of one file descriptor that closes it exactly once. Sockets, the epoll instance, the eventfd, the EMFILE spare descriptor and every client connection are UniqueFds, so an early `return` on a setup error cannot leak, and clearing the connection map at shutdown closes all clients. The signal handlers keep only a plain `int` copy of the wake eventfd, so they stay async-signal-safe.
+- `[[nodiscard]] std::expected<T, E>`: `create_listener`, `make_epoll`, `make_eventfd` and `connect_to` return `std::expected<UniqueFd, SysError>`; `epoll_add` and `send_all` return `std::expected<void, SysError>`. `SysError` is an enum naming the failed step plus the saved errno, so error paths never allocate, and a forgotten check is a compiler warning. Unlike an out-parameter plus error code, the descriptor only exists on success; unlike `std::optional`, the reason travels with the failure; unlike exceptions, control flow stays visible.
+- `std::expected<Reading, ParseError>`: `parse_reading` reports exactly why a line was rejected (`TooLong`, `MissingComma`, `BadTemperature`, `BadHumidity`, `TemperatureOutOfRange` including NaN, `HumidityOutOfRange`); `parse_interval_ms` does the same for the client argument, so a typo is an error instead of a silent default.
+- `std::span`: buffer + length pairs travel as one value: `send_all(fd, std::span<const char>, ...)`, `make_packet(..., std::span<const char> line)`, the `epoll_event` array (`std::span(events).first(n)`), and the client's arguments (`std::span<char*> args(argv, argc)`).
+- `std::string_view`: the framer, parser, packet `payload()` and command-line arguments are non-owning views. Strings handed to C APIs (`inet_pton`) are NUL-terminated (argv entries or literals).
+- `[[nodiscard]]` on fallible functions and accessors (`LineFramer::feed`, `parse_reading`, `wait_fd`, `Backoff::next`, ...).
+- `std::jthread`: workers join automatically when the `std::vector<std::jthread>` is cleared, so there are no manual join loops.
+- `std::unique_ptr<TelemetryPacket>` with `std::make_unique_for_overwrite`: each packet has exactly one owner from reactor to worker, and its payload is not zero-filled before being overwritten by the line.
+- `std::from_chars`: locale-independent, allocation-free parsing of the interval and of each reading.
+- `std::println` / `std::format` / `std::format_to_n`: single-call worker log lines, and client readings formatted into a stack buffer with no heap allocation per reading.
+- `std::chrono`: typed durations for the send interval, connect timeout and backoff (`std::chrono::ceil` for poll timeouts).
+- `std::atomic`: the stop flags and line counters are safe to write from a signal handler or several workers.
+
+Monadic `std::expected` chaining (`.and_then`/`.transform`) is not used: each setup step yields a different resource that later code needs by name, so plain early returns read more clearly here. A fallback via `.or_else`/`.value_or` would turn configuration typos into silent defaults, so the code reports them instead.
 
 ## Ownership & Memory Scrubbing Flow
 
-1. Reactor copies one complete line into a newly allocated std::unique_ptr<TelemetryPacket>.
+1. Reactor reads into a reusable stack buffer and, for each complete line only, copies it into a new std::unique_ptr<TelemetryPacket> (make_packet).
 2. Reactor moves ownership into TelemetryPipeline::push().
 3. Worker thread receives exclusive ownership from TelemetryPipeline::pop().
-4. When the packet is destroyed (after processing, when evicted by the drop-oldest policy, or during exception unwinding), ~TelemetryPacket() zeroes the payload buffer via std::memset before the memory returns to the allocator. Because a plain memset of memory that is about to be freed can legally be optimized away, use explicit_bzero() if scrubbing must be guaranteed. Partial-line buffers are not scrubbed.
+4. When the packet is destroyed (after processing, when evicted by the drop-oldest policy, or during exception unwinding), ~TelemetryPacket() zeroes the payload buffer with explicit_bzero() before the memory returns to the allocator; unlike a plain memset, it cannot be removed by the optimizer. Partial-line buffers and the reusable read buffer are not scrubbed.
 5. On shutdown, workers drain the queue and the std::jthread pool is joined.
 
 ## Edge-Triggered & Overflow Contracts
 
 - Edge-Triggered Drain Contract: Because sockets are registered with EPOLLET, every ready file descriptor must be drained until EAGAIN. Both accept4() and read() are wrapped in loops that exit only on EAGAIN/EWOULDBLOCK, end of stream or a hard error; failing to drain would silently lose subsequent data until the next edge transition.
 - Hang-Up Contract: EPOLLRDHUP/EPOLLHUP often arrive together with EPOLLIN when a device sends its last reading and closes, so the socket is always drained before it is closed.
-- Overflow Policy: TelemetryPipeline is capped at 10,000 packets. When full, the oldest packet is dropped before inserting the newest, prioritizing fresh telemetry while bounding memory without stalling the reactor. No back-pressure is applied to clients; dropped packets are not counted.
+- Overflow Policy: TelemetryPipeline is capped at 10,000 packets. When full, the oldest packet is dropped before inserting the newest, prioritizing fresh telemetry while bounding memory without stalling the reactor. No back-pressure is applied to clients; dropped packets are counted and reported at shutdown as `dropped_queue_full`.
 - Queue Wake-Up Policy: push() calls notify_one() to wake a single worker; shutdown() sets the stop flag under the queue mutex and calls notify_all(), so no worker can miss the wake-up.
 
 ## Detailed Shutdown Sequence
@@ -249,28 +300,37 @@ The reactor waits with no timeout, so shutdown is delivered through an eventfd r
 
 1. SIGINT/SIGTERM handler performs only async-signal-safe work: it stores g_running = false and write()s a uint64_t 1 to the eventfd (preserving errno).
 2. The eventfd becomes readable, so epoll_wait returns immediately, no matter which thread received the signal. If the signal arrives just before epoll_wait is entered, the counter is already set and epoll_wait returns at once. If epoll_wait is interrupted with EINTR, the loop re-checks the flag.
-3. The reactor stops reading, so no new lines are queued. pipeline->shutdown() sets the stop flag under the queue mutex, reports how many packets are still queued, and broadcasts notify_all().
+3. The reactor stops reading and closes every client connection, so no new lines are queued. pipeline->shutdown() sets the stop flag under the queue mutex, reports how many packets are still queued, and broadcasts notify_all().
 4. Workers keep calling pop() and process every line that was already queued; pop() returns nullptr only when shutdown was requested and the queue is empty.
-5. workers.clear() joins the std::jthread pool, the line counters are printed, and the listening socket, epoll fd, eventfd and spare descriptor are closed. Client sockets (and any partial lines they hold) are closed by the kernel at process exit.
+5. Client connections (and any partial lines they hold) are closed by clearing the connection map, workers.clear() joins the std::jthread pool, and the line counters are printed. The listening socket, epoll fd, eventfd and spare descriptor are UniqueFds closed when main returns.
 
 Draining is unbounded in time: with a large backlog and slow processing, shutdown takes as long as the workers need to finish the queue (at most 10,000 packets). Process managers such as systemd (TimeoutStopSec, 90 s by default) or Kubernetes (terminationGracePeriodSeconds, 30 s by default) send SIGKILL if that limit is exceeded.
 
-The client uses the same eventfd doorbell: its poll() wakes immediately on Ctrl-C, including while it is connecting or waiting for a full socket buffer to drain.
+The client uses the same eventfd doorbell: its poll() wakes immediately on Ctrl-C, including while it is connecting, waiting out a reconnect backoff, or waiting for a full socket buffer to drain.
 
 ## Testing, Troubleshooting & Production Hardening
 
 ### Unit Testing (tests.cpp)
 
-tests.cpp links against line_framer.hpp (the same framer the reactor uses) and checks that a 128-byte LF line is accepted, a 128-byte CRLF line is accepted, a 129-byte line is rejected, a CRLF terminator split across two reads (`\r` then `\n`) is accepted at 128 bytes, and blank lines are skipped. It also keeps a few sanity checks: the atomic stop flag starts true and can be cleared, a polling thread exits when the flag is cleared, and a sample `temperature,humidity` line has the expected format. It does not include server.cpp or client.cpp, so it does not exercise the epoll reactor, worker validation or shutdown path; those are verified by running the server and client together.
+tests.cpp includes the same headers the server and client use (line_framer.hpp, reading.hpp, pipeline.hpp, net_util.hpp), so it tests the real code (48 checks):
+
+- LineFramer: 128-byte LF and CRLF lines accepted, 129-byte lines rejected, CRLF and lines split across reads, blank lines skipped.
+- parse_reading: a valid line, range boundaries, and every ParseError (including NaN as TemperatureOutOfRange); parse_interval_ms rejects `0`, `-5`, `10ms` and empty input.
+- TelemetryPipeline: drop-oldest with a counted drop, shutdown reports the queued count, workers still drain after shutdown.
+- UniqueFd: move transfers ownership, reassignment closes, an `std::expected` holding a UniqueFd closes it when replaced.
+- net_util: bad IP, port-in-use (`Bind`/EADDRINUSE), connect success and `connection refused`, `send_all` of a span over a socketpair, EPIPE without SIGPIPE after the peer closes, `wait_fd` timeout and eventfd wake-up, and the backoff sequence 1, 2, 4, 8, 16, 30, 30 s.
+
+The epoll reactor loop and the client's session loop are verified by running server and client together (normal run, client started before the server, server killed mid-stream, Ctrl-C during backoff), under AddressSanitizer/UBSan, and with `strace -c` to confirm there are no idle wake-ups.
 
 ### Troubleshooting
 
 | Symptom | Likely Cause & Fix |
 |---------|--------------------|
 | Address already in use | Another process holds port 8883 (`ss -tulpn \| grep 8883`). Stop it or change SERVER_PORT. The server exits with code 1. |
-| Client cannot connect | Confirm ./server is running and local firewall rules (ufw/iptables) allow TCP traffic on port 8883. |
+| Client keeps printing "connection refused" or "connect timeout" | It is retrying with backoff. Confirm ./server is running and local firewall rules (ufw/iptables) allow TCP traffic on port 8883; the client connects by itself once the server is reachable. |
+| Client exits with "bad IP address" | Pass an IPv4 dotted quad, e.g. `./client 192.168.1.10`; host names are not resolved. |
 | Client exits with "Invalid interval" | The interval must be an integer of at least 1 ms, e.g. `./client 127.0.0.1 500`. |
-| "Invalid reading ... dropped" | The line is not `temperature,humidity` with temperature in -40..125 and humidity an integer in 0..100. |
+| "Rejected line from fd=N ...: <reason>" | The line is not `temperature,humidity` with temperature in -40..125 and humidity an integer in 0..100; the reason names which part failed. |
 | "Line longer than 128 bytes ... disconnecting" | The sender is not using newline-terminated lines or sent an oversized line. |
 | "Discarded N-byte unterminated line" | The connection closed in the middle of a line; terminate every reading with `\n`. |
 | Ctrl-C takes a long time on the server | Workers are draining a large backlog. Each line already queued is processed before exit. |
@@ -281,7 +341,7 @@ tests.cpp links against line_framer.hpp (the same framer the reactor uses) and c
 
 - Horizontal Scaling: Run multiple server processes behind a load balancer, or set SO_REUSEPORT (not set today) and adopt a multi-reactor design (one epoll instance per core) for extreme connection rates.
 - Security & Observability: Wrap sockets in TLS (OpenSSL/mbedTLS), add device authentication, redirect stdout/stderr to journald or a log daemon, and expose the atomic counters (plus accepted connections, dropped packets, queue depth) to Prometheus.
-- Possible extensions: Add an outbound write buffer for server-to-client responses, identify devices by an ID instead of the socket descriptor, persist telemetry to disk or a time-series database, and scrub partial-line buffers.
+- Possible extensions: Add an outbound write buffer for server-to-client responses, identify devices by an ID instead of the socket descriptor, persist telemetry to disk or a time-series database, scrub partial-line buffers, and buffer readings on the client while it is reconnecting.
 
 ## Limitations
 
@@ -290,13 +350,13 @@ This is a compact teaching and reference implementation:
 - No TLS and no authentication: traffic is plain TCP on port 8883 (the port conventionally used for MQTT over TLS), and any client may send readings.
 - Devices are identified only by the server-side socket descriptor, which is reused after disconnects.
 - Readings are validated and logged but not stored or forwarded.
-- Dropped packets (queue overflow) are not counted or reported, and every processed line is logged to stdout.
-- Client: IPv4 only, port fixed at 8883, no reconnect logic, simulated sensor values.
+- Every processed line is logged to stdout.
+- Client: IPv4 only (no host-name resolution), port fixed at 8883, simulated sensor values; readings due while disconnected are not buffered.
 - The server never writes to clients, so it needs no SIGPIPE handling; the client handles it as described above.
 
 ## Scripts
 
-deploy.sh checks for g++ and make, installs any missing packages, builds the three binaries (server, client, tests) with -std=c++23 -O2 -pthread, and runs the tests. See [Automated Setup & Build](#automated-setup--build-deploysh) for details.
+deploy.sh checks for g++ and make, installs any missing packages, builds the three binaries (server, client, tests) with -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread, and runs the tests. See [Automated Setup & Build](#automated-setup--build-deploysh) for details.
 
 Example:
 
@@ -308,7 +368,7 @@ Example:
 
 The server listens on TCP port 8883 on all IPv4 interfaces. A failed bind almost always indicates that another process already owns the port; ss -tulpn | grep 8883 identifies the occupant.
 
-All diagnostic output appears on standard output and standard error. In production these streams should be captured by the system logging facility. The reactor thread only accepts, reads, splits lines and enqueues; it allocates one TelemetryPacket per complete line and grows a small per-connection string only while a line is incomplete.
+All diagnostic output appears on standard output and standard error. In production these streams should be captured by the system logging facility. The reactor thread only accepts, reads, splits lines and enqueues; it reads into one reusable buffer, allocates one TelemetryPacket per complete line, and grows a small per-connection string only while a line is incomplete.
 
 The worker count is computed as twice the hardware concurrency reported by the standard library, with a fallback of four threads when the query returns zero. This sizing provides enough concurrency to absorb short processing bursts while remaining modest for a light workload.
 
