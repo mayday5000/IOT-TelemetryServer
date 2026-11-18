@@ -26,9 +26,9 @@ else
 fi
 
 echo "[deploy] Building..."
-g++ -std=c++23 -O2 -pthread -o server server.cpp
-g++ -std=c++23 -O2 -pthread -o client client.cpp
-g++ -std=c++23 -O2 -pthread -o tests tests.cpp
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o server server.cpp
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o client client.cpp
+g++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -pthread -o tests tests.cpp
 
 echo "[deploy] Running tests..."
 ./tests
